@@ -19,6 +19,10 @@ export interface NativeExecOptions {
   timeoutSecs?: number | undefined;
   user?: string | undefined;
   stdin?: string | undefined;
+  /** Keep stdin open so the stream exposes `write`/`eof` (the CLI's `-i`). */
+  interactive?: boolean | undefined;
+  /** Allocate a PTY (implies stdin; adds `resize`) — the CLI's `-t`. */
+  tty?: boolean | undefined;
 }
 
 export interface NativeStopOptions {
@@ -136,6 +140,16 @@ export interface NativeExecStreamEvent {
 /** A live exec stream: `next()` resolves the next event, or `null` at end. */
 export interface NativeExecStream {
   next(): Promise<NativeExecStreamEvent | null>;
+  /**
+   * Interactive streams only (`tty`/`interactive`): write bytes to the
+   * command's stdin. Rejects on an output-only stream rather than dropping
+   * the bytes.
+   */
+  write?(data: Buffer): Promise<void>;
+  /** Interactive streams only: close stdin (EOF, or a PTY hangup). */
+  eof?(): Promise<void>;
+  /** `tty` streams only: resize the PTY. */
+  resize?(cols: number, rows: number): Promise<void>;
   /** Kill the command; pending and later `next()` calls resolve `null`. */
   kill(): void;
 }

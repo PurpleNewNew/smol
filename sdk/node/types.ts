@@ -435,6 +435,16 @@ export interface ExecOptions {
    *  it running (a dev server, an agent) after the call ends. It takes no
    *  stdin and no timeout. */
   background?: boolean;
+  /** Keep the command's stdin open for the stream's lifetime — the CLI's `-i`.
+   *  Only `execInteractive()` acts on it: the returned stream then exposes
+   *  `write()` and `eof()`. Use this for byte-exact protocol relays, which
+   *  want a pipe rather than a terminal. */
+  interactive?: boolean;
+  /** Allocate a pseudo-terminal — the CLI's `-t`. Implies `interactive`, and
+   *  additionally gives the stream `resize()`. A PTY's line discipline
+   *  rewrites bytes, so prefer `interactive` alone for anything that is not a
+   *  person at a terminal. */
+  tty?: boolean;
 }
 
 /** Result of a command execution. */

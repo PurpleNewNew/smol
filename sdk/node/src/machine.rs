@@ -10,8 +10,15 @@ use napi_derive::napi;
 use crate::error::IntoNapiResult;
 use crate::exec_stream_utf8::Utf8ExecStream;
 use crate::types::*;
-use smolvm::agent::ExecEvent;
+use smolvm::agent::{
+    interactive_input, ExecEvent, InteractiveInput, InteractiveInputSender, InteractiveOutput,
+};
 use smolvm::embedded::{runtime, ForkSourcePolicy, MachineSpec};
+
+/// How many stdin events may queue before `write()` starts awaiting. Matches
+/// the engine's own default so a paste burst is absorbed without unbounded
+/// memory growth.
+const INTERACTIVE_INPUT_CAPACITY: usize = 64;
 
 fn join_error(err: tokio::task::JoinError) -> napi::Error {
     napi::Error::from_reason(format!("Task join error: {}", err))
@@ -108,6 +115,10 @@ pub struct NapiMachine {
 pub struct ExecStream {
     rx: std::sync::Arc<std::sync::Mutex<ExecStreamReceiver>>,
     cancel: smolvm::embedded::ExecCancel,
+    /// Sending half of the command's stdin channel. `None` for output-only
+    /// streams (`tty`/`interactive` unset), which is what makes `write()`
+    /// reject instead of silently dropping bytes.
+    input: Option<InteractiveInputSender>,
 }
 
 struct ExecStreamReceiver {
@@ -153,6 +164,55 @@ impl ExecStream {
         } else {
             Ok(event)
         }
+    }
+
+    /// Write bytes to the command's stdin. Only interactive streams
+    /// (`tty`/`interactive`) accept it; an output-only stream rejects rather
+    /// than dropping the bytes. Resolves once the bytes are queued.
+    #[napi]
+    pub async fn write(&self, data: Buffer) -> napi::Result<()> {
+        let sender = self.input.as_ref().ok_or_else(|| {
+            napi::Error::from_reason(
+                "this exec stream is not interactive — start it with tty: true (or interactive: true) to write stdin",
+            )
+        })?;
+        sender
+            .send(InteractiveInput::Stdin(data.to_vec()))
+            .await
+            .map_err(|_| napi::Error::from_reason("stdin channel closed (command exited)"))
+    }
+
+    /// Resize the command's PTY. Requires `tty: true`; `interactive: true`
+    /// alone opens stdin without a terminal, so resizing it rejects.
+    #[napi]
+    pub async fn resize(&self, cols: u32, rows: u32) -> napi::Result<()> {
+        let sender = self.input.as_ref().ok_or_else(|| {
+            napi::Error::from_reason(
+                "this exec stream is not interactive — start it with tty: true to resize",
+            )
+        })?;
+        sender
+            .send(InteractiveInput::Resize {
+                cols: cols as u16,
+                rows: rows as u16,
+            })
+            .await
+            .map_err(|_| napi::Error::from_reason("input channel closed (command exited)"))
+    }
+
+    /// Close the command's stdin (send EOF). A PTY command sees a hangup, a
+    /// pipe command reads EOF. Interactive streams only; idempotent.
+    #[napi]
+    pub async fn eof(&self) -> napi::Result<()> {
+        let sender = self.input.as_ref().ok_or_else(|| {
+            napi::Error::from_reason(
+                "this exec stream is not interactive — start it with tty: true (or interactive: true) to close stdin",
+            )
+        })?;
+        sender
+            .send(InteractiveInput::Eof)
+            .await
+            .map_err(|_| napi::Error::from_reason("input channel closed (command exited)"))
     }
 
     /// Kill the command: its connection closes and the guest agent kills it.
@@ -484,22 +544,80 @@ impl NapiMachine {
     #[napi]
     pub fn exec_stream(&self, command: Vec<String>, options: Option<ExecOptions>) -> ExecStream {
         let name = self.name.clone();
+        // Read the flags before parse_exec_options consumes the options:
+        // `interactive` is SDK-only (it decides whether a stdin channel exists),
+        // `tty` additionally reaches the engine and allocates the PTY.
+        let wants_stdin = options
+            .as_ref()
+            .map(|o| o.interactive.unwrap_or(false) || o.tty.unwrap_or(false))
+            .unwrap_or(false);
         let options = parse_exec_options(options);
         let cancel = smolvm::embedded::ExecCancel::new();
         let worker_cancel = cancel.clone();
         let (tx, rx) = std::sync::mpsc::channel::<ExecEvent>();
         let err_tx = tx.clone();
+
+        // Interactive sessions need a paired input channel: the JS side keeps
+        // the sender, the engine consumes the receiver on its session thread.
+        let mut input_sender = None;
+        let mut input_receiver = None;
+        if wants_stdin {
+            match interactive_input(INTERACTIVE_INPUT_CAPACITY) {
+                Ok((sender, receiver)) => {
+                    input_sender = Some(sender);
+                    input_receiver = Some(receiver);
+                }
+                Err(e) => {
+                    // No channel → the stream cannot be interactive. Report it
+                    // as an error event; silently downgrading to an output-only
+                    // stream would make every later write() a confusing reject.
+                    let _ = err_tx.send(ExecEvent::Error(format!(
+                        "failed to open the interactive stdin channel: {e}"
+                    )));
+                }
+            }
+        }
+
         std::thread::spawn(move || {
-            let result = runtime().and_then(|rt| {
-                rt.exec_streaming_with_options(&name, command, options, &worker_cancel, move |ev| {
-                    let _ = tx.send(ev);
-                })
-            });
+            let result = match runtime() {
+                Ok(rt) => match input_receiver {
+                    Some(receiver) => rt
+                        .exec_interactive_with_options(
+                            &name,
+                            command,
+                            options,
+                            &worker_cancel,
+                            receiver,
+                            move |out| {
+                                // Interactive output arrives as its own type;
+                                // flatten it onto ExecEvent so `next()` keeps
+                                // one decode path for both session kinds.
+                                let ev = match out {
+                                    InteractiveOutput::Stdout(bytes) => ExecEvent::Stdout(bytes),
+                                    InteractiveOutput::Stderr(bytes) => ExecEvent::Stderr(bytes),
+                                };
+                                let _ = tx.send(ev);
+                            },
+                        )
+                        .map(|_exit_code| ()),
+                    None => rt.exec_streaming_with_options(
+                        &name,
+                        command,
+                        options,
+                        &worker_cancel,
+                        move |ev| {
+                            let _ = tx.send(ev);
+                        },
+                    ),
+                },
+                Err(e) => Err(e),
+            };
             if let Err(e) = result {
                 let _ = err_tx.send(ExecEvent::Error(e.to_string()));
             }
             // Senders drop here → channel closes → next() resolves null.
         });
+
         ExecStream {
             rx: std::sync::Arc::new(std::sync::Mutex::new(ExecStreamReceiver {
                 rx,
@@ -507,6 +625,7 @@ impl NapiMachine {
                 done: false,
             })),
             cancel,
+            input: input_sender,
         }
     }
 

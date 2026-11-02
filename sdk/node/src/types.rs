@@ -297,6 +297,16 @@ pub struct ExecOptions {
     /// Text written to the command's stdin, which is then closed. It is
     /// passed over the agent connection and never written to the guest disk.
     pub stdin: Option<String>,
+    /// Allocate a pseudo-terminal for the command (the CLI's `-t`). Only
+    /// `execStream` acts on it: it makes the stream interactive, so
+    /// `write()`/`resize()`/`eof()` reach the command. Ignored by the
+    /// non-streaming `exec` helpers.
+    pub tty: Option<bool>,
+    /// Keep the command's stdin open for the stream's lifetime (the CLI's
+    /// `-i`) without allocating a PTY. Use this for byte-exact protocol
+    /// relays that need stdin but not terminal semantics; `tty: true`
+    /// implies it.
+    pub interactive: Option<bool>,
 }
 
 /// How a stop or delete treats work still running on the machine.
@@ -555,5 +565,6 @@ pub fn parse_exec_options(options: Option<ExecOptions>) -> smolvm::embedded::Exe
             .map(|s| std::time::Duration::from_secs(s as u64)),
         user: opts.user,
         stdin: opts.stdin,
+        tty: opts.tty.unwrap_or(false),
     }
 }

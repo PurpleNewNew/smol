@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 import { createServer } from "node:net";
 import { ExecutionError, InvalidConfigError, NotSupportedError, SmolError, wrapNativeError } from "./errors";
-import { getNapiMachine } from "./native";
+import { getNapiMachine, type NativeExecStream } from "./native";
 import { localAvailability, type LocalAvailability } from "./availability";
 import {
   makeTransport,
@@ -415,6 +415,21 @@ export class Machine {
   /** Execute a command, yielding stdout/stderr/exit events. (local) */
   execStream(command: string[], opts?: ExecOptions): AsyncGenerator<ExecEvent> {
     return this.transport.execStream(command, opts);
+  }
+
+  /** Interactive exec returning the raw stream, so the caller can drive the
+   *  command's stdin after it starts: `write()` bytes, `eof()` to close it, and
+   *  `resize()` when the session allocated a PTY (`{ tty: true }`). Without
+   *  `tty` or `interactive` the stream is output-only and those methods reject.
+   *
+   *  This is the programmatic counterpart of the CLI's `-i`/`-t`. Use
+   *  `interactive: true` (a pipe) for byte-exact protocol relays — a PTY's line
+   *  discipline rewrites bytes, so `tty` is for a person at a terminal. */
+  execInteractive(
+    command: string[],
+    opts?: ExecOptions,
+  ): NativeExecStream {
+    return this.transport.execInteractive(command, opts);
   }
 
   /** Read a file from the machine. */

@@ -150,6 +150,10 @@ export interface Transport {
   exec(command: string[], opts?: ExecOptions): Promise<RawExec>;
   run(image: string, command: string[], opts?: ExecOptions): Promise<RawExec>;
   execStream(command: string[], opts?: ExecOptions): AsyncGenerator<ExecEvent>;
+  /** Interactive exec returning the raw stream: the caller drives stdin with
+   *  the stream's `write()`/`eof()`/`resize()` — the programmatic counterpart
+   *  of the CLI's `-i`/`-t`. Local only. */
+  execInteractive(command: string[], opts?: ExecOptions): NativeExecStream;
   readFile(path: string): Promise<Buffer>;
   readFileStream(path: string): AsyncGenerator<Uint8Array>;
   writeFile(path: string, data: Buffer, mode?: number): Promise<void>;
@@ -290,6 +294,11 @@ function toNativeExecOptions(
     timeoutSecs: opts.timeout,
     user: opts.user,
     stdin: stdinText(opts.stdin),
+    // Both must reach the native side: `tty` is what makes it allocate the PTY
+    // and open stdin at all, so dropping it here silently yields an
+    // output-only stream whose write() rejects.
+    interactive: opts.interactive,
+    tty: opts.tty,
     env:
       opts.env &&
       Object.entries(opts.env).map(([key, value]) => ({ key, value })),
@@ -648,6 +657,23 @@ class LocalTransport implements Transport {
     }
     try {
       return await this.inner.run(image, command, toNativeExecOptions(opts));
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+  }
+
+  execInteractive(
+    command: string[],
+    opts?: ExecOptions,
+  ): NativeExecStream {
+    opts?.signal?.throwIfAborted();
+    try {
+      // stdin is the point of this method, so `interactive` is always on; the
+      // caller decides whether it also wants a PTY via `tty`.
+      return this.inner.execStream(command, {
+        ...(toNativeExecOptions(opts) ?? {}),
+        interactive: true,
+      });
     } catch (e) {
       throw wrapNativeError(e);
     }
@@ -1590,6 +1616,10 @@ class CloudTransport implements Transport {
       "run(image, …) is not available on the cloud target; create a machine from an image " +
         "via Machine.create({ image }, { target: 'cloud' }) and use exec() instead.",
     );
+  }
+
+  execInteractive(): NativeExecStream {
+    throw new NotSupportedError("execInteractive is local-only.");
   }
 
   async *execStream(
